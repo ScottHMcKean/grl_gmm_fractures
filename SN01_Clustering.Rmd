@@ -1,0 +1,637 @@
+---
+title: "190901_MSClust_Updated"
+author: "Scott McKean"
+date: "September 1, 2018"
+output: html_document
+---
+
+# Microseismic Clustering Analysis
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(dplyr)
+library(plotly)
+library(corrplot)
+library(fpc)
+library(mclust)
+library(dbscan)
+```
+
+## Data Pre-processing
+First we decide what scenario we will analyze and pre-process the data
+
+1. Load preprocessed microseismic catalog
+2. Load preprocessed GeoScout completions file
+3. Load preprocessed GeoScout well survey file
+4. Remove events below magnitude of completeness
+5. Select microseismic features for analysis
+6. Subset the catalog to a well and stage
+7. Create a dataset label
+7. Select well row from completions
+8. Subset completions and survey dataframes
+10. Subset to a single stage
+
+```{r scenario_selection}
+# Load preprocessed ms data
+ms_df <- read.csv("processed_msdata.csv")
+
+# Load preprocessed survey data
+surv_df <- read.csv("processed_surveys.csv")
+
+# Load preprocessed completions
+comp_df <- read.csv("processed_fracs.csv")
+
+# Remove events below magnitude of completeness
+mw_complete <- -1.5
+ms_filt <- filter(ms_df, mw >= mw_complete)
+paste("Removed",nrow(ms_df) -nrow(ms_filt),"events below specified magnitude of completeness")
+
+# Select microseismic features for analysis
+ms_feat <- c("x","y","z","t","m0","strike","dip","rake")
+#ms_feat <- c("x_coord","y_coord","z_coord","date_time","m0","mti_strike")
+#ms_feat <- c("x_coord","y_coord","z_coord","date_time","m0")
+#ms_feat <- c("x_coord","y_coord","z_coord","date_time","mti_strike")
+#ms_feat <- c("x_coord","y_coord","z_coord","date_time")
+#ms_feat <- c("x_coord","y_coord","z_coord")
+## Set a prefix to label the features in the output files
+feat_str <- "all"
+
+# Select a well and stage for subsetting
+well_num <- 3
+stage_num <- 2
+
+# Generate a prefix string
+prefix <- paste(feat_str,"_W",well_num,"_S",stage_num,sep="")
+
+# Subset data to a single well and stage and select attributes in the data
+well_ms <- filter(ms_filt, well == well_num)
+well_ms <- well_ms[,ms_feat]
+stage_ms <- filter(ms_filt, well == well_num & stage == stage_num)
+stage_ms <- stage_ms[,ms_feat]
+
+# Scale well and stage ms
+all_ms_scaled <- data.frame(scale(ms_filt[,ms_feat]))
+well_ms_scaled <- data.frame(scale(well_ms))
+stage_ms_scaled <- data.frame(scale(stage_ms))
+```
+
+## Principal component analysis function definition
+
+1. Define shapiro-wilk test function
+2. Define correlation plot function
+2. Define principal component analysis function
+
+```{r pca_functions}
+# Create a function to output the results of a Shapiro-Wilk test for normality
+# Can handle between 3 and 5000 samples
+shapiro_wilk_analysis <- function(df){
+  if (nrow(df) >= 5000) {
+    bool_out <- FALSE
+  } else {
+      shapiro_wilk <- data.frame(attributes = ncol(df))
+    for (col in colnames(df)){
+      shapiro_res <- shapiro.test(df[,col])
+      shapiro_wilk[col] <- shapiro_res$p.value
+    }
+    p_value <- mean(as.numeric(shapiro_wilk[1,colnames(df)]))
+    print("Shapiro-Wilk Test Results:")
+    print(shapiro_wilk)
+    print(paste("Mean p-value:",p_value))
+    if (p_value > 0.01){
+      print("Data is likely normal - using Pearson correlation")
+      bool_out <- TRUE
+    } else {
+      print("Data isn't significantly normal - using Spearman correlation")
+      bool_out <- FALSE
+    }
+  }
+  
+  return(bool_out)
+}
+
+# Evaluate cross-correlation using the cor() function and corrplot() library
+# Use if/else to control type of correlation to use based on Shapiro-Wilks function
+# Create a publication quality jpeg and output with prefix
+corrplot_swbool <- function(scaled_well_ms,prefix_str){
+  if (shapiro_wilk_analysis(scaled_well_ms)){
+  # Normal data analysis using Pearson
+  jpeg(paste(prefix_str,"_corr.jpeg",sep=""),width = 15, height = 15, units = 'cm', res = 300)
+  corrplot(cor(scaled_well_ms, method = 'pearson'), 
+           tl.col = 'black', type = 'upper', method = 'ellipse',
+           order = 'FPC', tl.srt = 45)
+  dev.off()
+  postscript(paste(prefix_str,"_corr.eps",sep=""),width = 5, height = 5)
+  corrplot(cor(scaled_well_ms, method = 'pearson'), 
+           tl.col = 'black', type = 'upper', method = 'ellipse',
+           order = 'FPC', tl.srt = 45)
+  dev.off()
+} else {
+  # Non-Parametric analysis using Spearman
+  jpeg(paste(prefix_str,"_corr.jpeg",sep=""),width = 15, height = 15, units = 'cm', res = 300)
+  corrplot(cor(scaled_well_ms, method = 'spearman'), 
+           tl.col = 'black', type = 'upper', method = 'ellipse',
+           order = 'FPC', tl.srt = 45)
+  dev.off()
+  postscript(paste(prefix_str,"_corr.eps",sep=""),width = 5, height = 5)
+  corrplot(cor(scaled_well_ms, method = 'spearman'), 
+           tl.col = 'black', type = 'upper', method = 'ellipse',
+           order = 'FPC', tl.srt = 45)
+  dev.off()
+}
+}
+
+pca_analysis <- function(scaled_well_ms,prefix_str){
+  #' Function to run principal component analysis using the prcomp() package (uses single vector decomposition)
+  pca <- prcomp(scaled_well_ms)
+  ## print pca summary
+  print(summary(pca))
+  
+  ## display squared sum of loadings (or rotation) for first three principal components
+  print("Squared Sum of Loadings:")
+  print(sort(rowSums(pca$rotation[,1:3]**2),decreasing = TRUE))
+  
+  # plot and save pca results using ggplot2
+  # create dataframe for ggplot
+  pca_df <- data.frame(var = summary(pca)$sdev**2, 
+                       pca = seq(1:length(summary(pca)$sdev)))
+  # make plot
+  pca_s_plot <- ggplot(pca_df, aes(pca,var)) +
+    geom_line() +
+    geom_point() +
+    ylab('Variance') +
+    scale_x_continuous(name = 'Principal Component', 
+                       breaks = seq(0,max(pca_df$pca)))+
+    theme_minimal() + 
+    ggsave(paste(prefix_str,"_pca_scree.eps",sep=""), 
+           width = 12, height = 12, units = 'cm') +
+    ggsave(paste(prefix_str,"_pca_scree.jpeg",sep=""), 
+           width = 12, height = 12, units = 'cm')
+  # print to rmd
+  print(pca_s_plot)
+  
+  # make a correlation matrix between PCA results and scaled results
+  correlations = as.data.frame(cor(scaled_well_ms,pca$x))
+  
+  # draw unit circle
+  tt = seq(0, 2 * pi, length = 100)
+  circle <- data.frame(x= 1 * cos(tt), y = 1 * sin(tt))
+  
+  # draw PCA arrows
+  arrows <- data.frame(x1 = rep(0,nrow(correlations)), 
+                       y1 = rep(0,nrow(correlations)),
+                       x2 = correlations$PC1,
+                       y2 = correlations$PC2)
+  
+  # scale PCA results to +/- 1 to fit on unit circle plot
+  range <- apply(pca$x, 2, range)
+  pca_results <- as.data.frame(scale(pca$x, center = TRUE, 
+                                     scale = abs(range[1,])+abs(range[2,]))) 
+  
+  # logical to colour by 'm0' if available
+  # custom ggplot of PCA results and unit circle
+  if(sum(colnames(scaled_well_ms) == 'm0') > 0){
+    pca_c_plot <- ggplot() +
+      geom_hline(yintercept = 0, colour = 'gray') +
+      geom_vline(xintercept = 0, colour = 'gray') +
+      geom_point(data = pca_results, 
+                 aes(x = PC1, y = PC2, size = scaled_well_ms$m0), alpha = 0.15) +
+      geom_path(data = circle, 
+                aes(x = x, y = y), colour = "gray65") +
+      geom_segment(data = arrows, 
+                   aes(x = x1, y = y1, xend = x2, yend = y2), colour = "gray65") +
+      geom_text(data = correlations, 
+                aes(x = PC1, y = PC2, label = rownames(correlations)), colour = 'red') +
+      xlim(-1.1, 1.1) + 
+      ylim(-1.1, 1.1) +
+      coord_fixed() +
+      labs(size = 'Scaled\nSeismic\nMoment') +
+      theme_minimal() +
+      ggsave(paste(prefix_str,"_pca_circle.jpeg",sep=""), 
+             width = 15, height = 15, units = 'cm') +
+      ggsave(paste(prefix_str,"_pca_circle.eps",sep=""), 
+             width = 15, height = 15, units = 'cm')
+    print(pca_c_plot)
+  } else {
+      pca_c_plot <- ggplot() +
+      geom_hline(yintercept = 0, colour = 'gray') +
+      geom_vline(xintercept = 0, colour = 'gray') +
+      geom_point(data = pca_results, 
+                 aes(x = PC1, y = PC2), colour = 'black', alpha = 0.15) +
+      geom_path(data = circle, 
+                aes(x = x, y = y), colour = "gray65") +
+      geom_segment(data = arrows, 
+                   aes(x = x1, y = y1, xend = x2, yend = y2), colour = "gray65") +
+      geom_text(data = correlations, 
+                aes(x = PC1, y = PC2, label = rownames(correlations)), colour = 'red') +
+      xlim(-1.1, 1.1) + 
+      ylim(-1.1, 1.1) +
+      coord_fixed() +
+      theme_minimal() +
+      ggsave(paste(prefix_str,"_pca_circle.jpeg",sep=""), 
+             width = 15, height = 15, units = 'cm') +
+      ggsave(paste(prefix_str,"_pca_circle.eps",sep=""), 
+             width = 15, height = 15, units = 'cm')
+    print(pca_c_plot)
+      }
+}
+
+
+
+```
+
+## Run principal component analysis on the whole catalogue and the well
+
+```{r pca}
+# Run the correlation analysis and plot it
+corrplot_swbool(all_ms_scaled,prefix)
+
+# Run the pca analysis and plot it
+pca_analysis(all_ms_scaled,prefix)
+```
+
+# Stats helper function
+
+Define a helper function was programmed to store the results of the clustering analyses, based on the output of the cluster.stats() funtion of the fpc() Package.
+
+```{r stats_to_df}
+#helper function to create a list of clustering statistics from dataframe
+stats_to_df <- function(stats,analysis_str = ""){
+  out_df <- data.frame('analysis' = analysis_str,
+                       'num_cluster' = stats$cluster.number,
+                       'silwidth' = stats$avg.silwidth,
+                       'ch' = stats$ch)
+  
+  return(out_df)
+}
+```
+
+Define a ggplot function to plot the data on an x-y planar view
+
+```{r gg_cluster_plot}
+gg_cluster_plot <- function(well_ms,prefix,type_str, title = ''){
+  
+  well_num <- names(sort(table(well_ms$well)))[1]
+  
+  if ("m0" %in% colnames(stage_ms_scaled)){
+    plot <- ggplot(well_ms) + 
+      geom_point(aes(x = x_coord, y = y_coord, size = m0, 
+                        colour = factor(cluster)), alpha = 0.5) +
+      scale_size_continuous(name = "Magnitude")
+  } else {
+    plot <- ggplot(well_ms) + 
+      geom_point(aes(x = x_coord, y = y_coord, 
+                     colour = factor(cluster)), alpha = 0.5)
+  }
+   
+  plot <- plot + scale_color_discrete(name = "Cluster") +
+    xlab('Easting') +
+    ylab('Northing') +
+    theme_minimal() +
+    coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE)
+  
+  for (well_i in seq(length(unique(comp_df$well)))){
+      
+    plot <- plot +
+      geom_path(data = surv_df[surv_df$well == well_i,], aes(x=x,y=y)) + 
+      geom_point(data = comp_df[comp_df$well == well_i,], aes(x=x,y=y), 
+                 col ='red', size = 1)
+      
+  }
+  
+  plot <- plot +
+    ggtitle(title) +
+    ylim(0, 3000) +
+    xlim(1000, 3000) +
+    
+    ggsave(paste(prefix,"_",type_str,"_ggplot.jpeg",sep=""), 
+               width = 18, height = 14, units = 'cm')
+}
+```
+
+# Define k-medoids function
+
+1. Calculate distance matrix
+2. Run K-medoids with hyperparameter tuning using CH criterion
+3. Run K-medoids with hyperparameter tuning using ASW criterion
+4. Output results
+5. Run the K-medoids analysis
+
+```{r k-medoids}
+k_medoids <- function(scaled_well_ms, well_ms, prefix_str = 'test', krange_vect = 1:10){
+  
+  # Generate distance matrix
+  dist_matrix <- dist(scaled_well_ms, method = 'euclidean') 
+  
+  # Run k-medoids using CH criterion
+  km_ch <- pamk(scaled_well_ms, krange = krange_vect, usepam=FALSE, criterion = 'ch')
+  km_ch_stats <- cluster.stats(dist_matrix, clustering = km_ch$pamobject$clustering,
+                               silhouette = TRUE, G2 = FALSE, G3 = FALSE, 
+                               sepwithnoise = FALSE, compareonly = FALSE,
+                               aggregateonly = TRUE)
+  km_ch_df <- stats_to_df(km_ch_stats,'km_ch')
+  well_ms$cluster <- km_ch$pamobject$clustering
+  gg_cluster_plot(well_ms,prefix_str,type_str = 'km_ch',title = "Partitional (CH)")
+  
+  # Run k-medoids using ASW criterion
+  km_asw <- pamk(scaled_well_ms, krange = krange_vect, usepam=FALSE, criterion = 'multiasw')
+  km_asw_stats <- cluster.stats(dist_matrix, clustering = km_asw$pamobject$clustering,
+                               silhouette = TRUE, G2 = FALSE, G3 = FALSE, 
+                               sepwithnoise = FALSE, compareonly = FALSE,
+                               aggregateonly = TRUE)
+  km_asw_df <- stats_to_df(km_asw_stats,'km_asw')
+  well_ms$cluster <- km_asw$pamobject$clustering
+  gg_cluster_plot(well_ms,prefix_str,type_str = 'km_asw', title = "Partitional (ASW)")
+  
+  # Combine k-medoids
+  km_df <- rbind(km_ch_df,km_asw_df)
+  print("K-Medoids Results:")
+  print(km_df)
+  
+  # Output clusters
+  return (list(km_df,km_ch$pamobject$clustering,km_asw$pamobject$clustering))
+}
+```
+
+Run the K-medoids analysis
+
+```{r run_k_med}
+# Run the k-medoids analysis (generates three plots)
+km_res <- k_medoids(stage_ms_scaled,stage_ms,prefix,krange_vect = 3:30)
+```
+
+Dendogram plotting helper function
+ 
+```{r dendo_plot}
+# Sub-function to plot dendogram with 5 extra stages plotted
+  dendo_plot <- function(scaled_well_ms, hc_ward,krange_vect,k_num,prefix_str,type_str){
+    memb <- cutree(hc_ward, max(krange_vect))
+    cent <- NULL
+    for (k in 1:max(krange_vect)){
+    cent <- rbind(cent, colMeans(scaled_well_ms[memb == k, , drop = FALSE]))
+    }
+    hc_cut <- hclust(dist(cent, method = 'euclidean'), method = 'ward.D2', members = table(memb))
+    jpeg(paste(prefix_str,"_",type_str,"_",'dendo.jpeg',sep=''))
+    plot(hc_cut, labels = FALSE,
+         sub = "" ,
+         xlab = paste("Tree cut at k = ",max(krange_vect),",",k_num,"clusters outlined"),
+         main = "Hierarchical Clustering Dendogram")
+    rect.hclust(hc_cut, k = k_num, border = 'red')
+    dev.off()
+  }
+```
+
+Define a hierarchical clustering function using Ward's method.
+
+```{r hclust}
+# Define an automated heirchical clustering function
+h_cluster <- function(scaled_well_ms, well_ms, prefix_str = 'test', krange_vect = 1:10){
+  
+  # Generate distance matrix
+  dist_matrix <- dist(scaled_well_ms, method = 'euclidean') 
+
+  # Run hclust() using Ward's (1965) method
+  hc_ward <- hclust(dist_matrix, method = 'ward.D2')
+  
+  # Initialize vector to record clusters
+  clust_list <- vector('list',length(krange_vect))
+  stats_list <- vector('list',length(krange_vect))
+  ch_vect <- vector('numeric',length(krange_vect))
+  asw_vect <- vector('numeric',length(krange_vect))
+  i <- 1
+  
+  # For loop to analyze the range of clusters desired and compute statistics
+  for (k_temp in krange_vect){
+    clust_list[[i]] <- cutree(hc_ward, k = k_temp)
+    stats_list[[i]] <- cluster.stats(dist_matrix, clustering = clust_list[[i]],
+                                   silhouette = TRUE, G2 = FALSE,
+                                   G3 = FALSE, sepwithnoise = FALSE,
+                                   compareonly = FALSE,
+                                   aggregateonly = TRUE)
+    
+    # Write key statistics to vectors
+    ch_vect[[i]] <- stats_list[[i]]$ch
+    asw_vect[[i]] <- stats_list[[i]]$avg.silwidth
+    
+    # Print output for status (computationally heavy, takes time)
+    # print(i)
+    # print(stats_list[[i]]$cluster.number)
+    # print(stats_list[[i]]$ch)
+    # print(stats_list[[i]]$avg.silwidth)
+    
+    # Iterate
+    i <- i + 1
+  }
+  
+  # Select method with best CH index value
+  hc_ch_stats <- stats_list[[which(ch_vect == max(ch_vect))]]
+  hc_ch_df <- stats_to_df(hc_ch_stats,'hc_ch')
+  hc_ch <- clust_list[[which(ch_vect == max(ch_vect))]]
+  well_ms$cluster <- hc_ch
+  gg_cluster_plot(well_ms,prefix_str,type_str = 'hc_ch',title = "Hierarchical (CH)")
+
+  dendo_plot(scaled_well_ms, hc_ward,krange_vect,
+             if(hc_ch_stats$cluster.number == max(krange_vect)){max(krange_vect)-1} else {
+               hc_ch_stats$cluster.number},prefix,'hc_ch')
+  
+  # Select number of clusters with best ASW
+  hc_asw_stats <- stats_list[[which(asw_vect == max(asw_vect))]]
+  hc_asw_df <- stats_to_df(hc_asw_stats,'hc_asw')
+  hc_asw <- clust_list[[which(asw_vect == max(asw_vect))]]
+  well_ms$cluster <- hc_asw
+  gg_cluster_plot(well_ms,prefix_str,type_str = 'hc_asw',title = "Hierarchical (ASW)")
+  
+  # Plot dendogram
+  dendo_plot(scaled_well_ms, hc_ward,krange_vect,
+             if(hc_asw_stats$cluster.number == max(krange_vect)){max(krange_vect)-1} else 
+               {hc_asw_stats$cluster.number},
+             prefix,'hc_asw')
+  
+  # Combine h. clustering results
+  hc_df <- rbind(hc_ch_df,hc_asw_df)
+  print("Hierarchical Clustering Results:")
+  print(hc_df)
+  
+  # Output clusters
+  return (list(hc_df,hc_ch,hc_asw))
+}
+```
+
+Run hierarchical clustering
+
+```{r run_hc}
+hc_res <- h_cluster(stage_ms_scaled,stage_ms,prefix,krange_vect = 3:30)
+```
+
+The following function generates the kNN-distance plot in R. This function is meant to be run several times to visually optimize the eps bound selection.
+
+```{r knn_dist_plot}
+# Define a helper function to select the elbow in the nearest-neighbours plot to bound eps value
+# Use dbscan::KNNdist to evaluate elbow in nearest-neighbours distance plot
+# Export a formatted ggplot for publications
+# Set k = ncol()+1 for the dataset
+kNN_ggplot <- function(scaled_well_ms, prefix_str = 'test', eps1 = 1, eps2 = 1.75){
+  k <- ncol(scaled_well_ms) + 1
+  kd <- data.frame('kNN' = sort(kNNdist(scaled_well_ms, k)), 'n' = 1:(nrow(scaled_well_ms)*k))
+  ggplot(kd, aes(x = n, y = kNN)) +
+      geom_line() + 
+      annotate("rect", xmin=0, xmax=nrow(scaled_well_ms)*k, ymin=eps1, ymax = eps2, alpha=0.35, fill="red") +
+      labs(x = 'k*Sample Sorted by Distance', y = 'Distance to k-Nearest Neighbours') +
+      ggtitle(paste("k-Nearest Neighbour Plot with k =",k)) +
+      scale_y_continuous(breaks = seq(0,as.integer(1.1*max(kd$kNN)),0.5)) +
+      theme_minimal() +
+      ggsave(paste(prefix_str,"_kNNPlot.jpeg",sep=""), 
+             width = 15, height = 15, units = 'cm')
+}
+```
+
+Define a function that uses the DBSCAN algorithm using the scaled microseismic data and the user inputted eps values. It computes a distance matrix for statistics purposes and assumes that k is equal to the number of dimensions + 1. The CH index and ASW are computed.
+
+```{r dbscan, warning= FALSE}
+
+# Define an automated DBSCAN function
+db_cluster <- function(scaled_well_ms, well_ms, prefix_str = 'test', eps1 = 1, eps2 = 2){
+  # Define eps range based on kNN plot helper function (manual)
+  eps_range <- seq(eps1,eps2,length.out = 10)
+  
+  # Generate distance matrix
+  dist_matrix <- dist(scaled_well_ms, method = 'euclidean')
+  
+  # Set k = D + 1
+  k <- ncol(scaled_well_ms) + 1
+  
+  # Initialize vector to record clusters
+  clust_list <- vector('list',length(eps_range))
+  stats_list <- vector('list',length(eps_range))
+  ch_vect <- vector('numeric',length(eps_range))
+  asw_vect <- vector('numeric',length(eps_range))
+  clust_vect <- vector('numeric',length(eps_range))
+  i <- 1
+  
+  # For loop to analyze the range of clusters desired and compute statistics
+  for (eps_temp in eps_range){
+    clust_list[[i]] <- dbscan::dbscan(scaled_well_ms, eps = eps_temp, minPts = k)$cluster
+    stats_list[[i]] <- cluster.stats(dist_matrix, clustering = clust_list[[i]],
+                                   silhouette = TRUE, G2 = FALSE,
+                                   G3 = FALSE, sepwithnoise = FALSE,
+                                   compareonly = FALSE,
+                                   aggregateonly = TRUE)
+    
+    # Write key statistics to vectors
+    ch_vect[[i]] <- stats_list[[i]]$ch
+    asw_vect[[i]] <- stats_list[[i]]$avg.silwidth
+    clust_vect[[i]] <- stats_list[[i]]$cluster.number
+    
+    # Iterate
+    i <- i + 1
+  }
+  
+  max(ch_vect)
+  which(ch_vect == max(ch_vect))
+  # Select method with best CH index value
+  db_ch_stats <- stats_list[[min(which(ch_vect == max(ch_vect)))]]
+  db_ch_df <- stats_to_df(db_ch_stats,'db_ch')
+  db_ch <- clust_list[[min(which(ch_vect == max(ch_vect)))]]
+  well_ms$cluster <- db_ch
+  gg_cluster_plot(well_ms,prefix_str,type_str = 'db_ch',title = "Density (CH)")
+  
+  # Select method with best ASW
+  db_asw_stats <- stats_list[[min(which(asw_vect == max(asw_vect)))]]
+  db_asw_df <- stats_to_df(db_asw_stats,'db_asw')
+  db_asw <- clust_list[[min(which(asw_vect == max(asw_vect)))]]
+  well_ms$cluster <- db_asw
+  gg_cluster_plot(well_ms,prefix_str,type_str = 'db_asw',title = "Density (ASW)")
+
+  # Combine h. clustering results
+  db_df <- rbind(db_ch_df,db_asw_df)
+  print("DBSCAN Clustering Results:")
+  print(db_df)
+  
+  # Output clusters
+  return (list('stats' = db_df, 'db_ch' = db_ch, 'db_asw' = db_asw))
+}
+```
+
+```{r run_dbscan}
+# Run the kNN ggplot analysis to pick eps values
+kNN_ggplot(stage_ms_scaled, prefix, eps1 = 0.75, eps2 = 1.5)
+
+# Run the dbscan analysis
+db_res <- db_cluster(stage_ms_scaled, stage_ms, prefix, eps1 = 0.75, eps2 = 1.5)
+```
+
+# Define Gaussian Mixture Model function
+
+1. Run the MClust package with up to 30 clusters and a VVV model
+   ()
+2. Run K-medoids with hyperparameter tuning using CH criterion
+3. Run K-medoids with hyperparameter tuning using ASW criterion
+4. Output results
+5. Run the K-medoids analysis
+
+```{r mclust}
+
+# Define an gaussian mixture model cluster function
+gmm_cluster <- function(scaled_well_ms, well_ms, prefix_str = 'test'){
+  
+  # Run model clustering
+  # Select up to 30 clusters
+  # Only use the vvv model
+  # Use the BIC to select the model
+  gmm_res <- Mclust(scaled_well_ms, G = 3:30, modelNames = c("VVV"))
+  gmm_res$parameters
+  # Default plot of results
+  print(summary(gmm_res))
+  
+  # Pull out clusters
+  clusters <- gmm_res$classification
+  
+  # Generate distance matrix
+  dist_matrix <- dist(scaled_well_ms, method = 'euclidean')
+  
+  # Calculate stats
+  stats <- cluster.stats(dist_matrix, clustering = clusters,
+                                   silhouette = TRUE, G2 = FALSE,
+                                   G3 = FALSE, sepwithnoise = FALSE,
+                                   compareonly = FALSE,
+                                   aggregateonly = TRUE)
+    
+  gmm_df <- stats_to_df(stats,'gmm')
+  gmm_df <- cbind(gmm_df,'bic' = gmm_res$bic)
+  
+  well_ms$cluster <- clusters
+  
+  gg_cluster_plot(well_ms,prefix_str,type_str = 'gmm',title = "Mixture Model")
+    
+  print("GMM Clustering Results:")
+  print(gmm_df)
+  
+# Output clusters
+return (list('stats' = gmm_df, 'gmm' = clusters))
+}
+```
+
+```{r run_gmm}
+# Run the dbscan analysis
+gmm_res <- gmm_cluster(stage_ms_scaled, stage_ms, prefix)
+```
+
+We save the statistics results and plot them in a histogram
+```{r save_res}
+# Save results
+results <- data.frame(rbind(km_res[[1]],hc_res[[1]],db_res[[1]], gmm_res[[1]][1:4]))
+results$prefix <- prefix
+write.csv(results,paste(prefix,"_results.csv",sep=""))
+```
+
+Now we take the results of the Zaliapin distance computation (done in Python) and plot it using the ggplot function.
+
+```{r plot_Zaliapin}
+# Import results
+clusters <- (read.csv('zaliapani_chres.csv'))
+clusters <- clusters[,1] + 1
+clusters <- append(clusters,1)
+
+stage_ms$cluster <- clusters
+  
+gg_cluster_plot(stage_ms,prefix,type_str = 'zaliapin',title = "Zaliapin et al. Hierarchical (CH)")
+```
